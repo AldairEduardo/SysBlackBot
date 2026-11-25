@@ -1,0 +1,13 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+*.log
+data/
+session.json
+session.enc
+secret.key
+bot.db
+bot.db-*
+.login-error.*
+.playwright/

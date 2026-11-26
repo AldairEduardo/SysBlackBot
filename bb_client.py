@@ -550,6 +550,7 @@ class BlackboardSession:
         self.key_path = Path(key_path)
         self._cookies: list[dict] = self._load_cookies()
         self._client: httpx.AsyncClient | None = None
+        self._me: dict | None = None
 
     # ------------------------------------------------------------- cookies
     def _load_cookies(self) -> list[dict]:
@@ -582,7 +583,14 @@ class BlackboardSession:
         blob = crypto_store.encrypt_json(self.key_path, doc)
         _atomic_write(self.session_path, blob)
         self._cookies = cleaned
-        self._reset_client()
+        self._me = None
+        # Descarta el cliente con las cookies viejas (save_cookies es sincrono).
+        old_client, self._client = self._client, None
+        if old_client is not None:
+            try:
+                asyncio.get_running_loop().create_task(old_client.aclose())
+            except RuntimeError:
+                pass
 
     async def reset(self) -> None:
         self._cookies = []
@@ -715,10 +723,57 @@ class BlackboardSession:
         if courses:
             return courses
 
+        # La API interna oculta las inscripciones no disponibles. La API
+        # publica si las lista; /users/me/courses ya no existe (HTTP 404).
+        try:
+            return await self._fetch_courses_public()
+        except SessionExpired:
+            raise
+        except BlackboardError as exc:
+            log.warning("API publica de cursos fallo (%s); sin cursos", exc)
+            return []
+
+    async def _fetch_courses_public(self) -> list[Course]:
+        me = await self.fetch_me()
+        user_id = str(me.get("id") or "").strip()
+        if not user_id:
+            return []
         payload = await self._get_json(
-            "/learn/api/v1/users/me/courses", {"limit": 100, "offset": 0}
+            f"/learn/api/public/v1/users/{quote(user_id, safe='')}/courses",
+            {"limit": 100},
         )
-        return parse_my_courses(payload)
+        courses: list[Course] = []
+        seen: set[str] = set()
+        for membership in _results(payload):
+            if not isinstance(membership, dict):
+                continue
+            course_id = str(membership.get("courseId") or "").strip()
+            if not course_id or course_id in seen:
+                continue
+            seen.add(course_id)
+            available = (membership.get("availability") or {}).get("available")
+            name, display_id = course_id, ""
+            try:
+                detail = await self._get_json(
+                    f"/learn/api/public/v3/courses/{quote(course_id, safe='')}"
+                )
+                name = str(detail.get("name") or course_id).strip()
+                display_id = str(detail.get("courseId") or "").strip()
+            except SessionExpired:
+                raise
+            except BlackboardError:
+                pass  # sin permiso para ver el curso (p. ej. inscripcion desactivada)
+            courses.append(
+                Course(
+                    id=course_id,
+                    name=name,
+                    role=str(membership.get("courseRoleId") or ""),
+                    display_id=display_id,
+                    is_closed=str(available).lower() == "no",
+                )
+            )
+        log.info("Cursos via API publica: %s", len(courses))
+        return courses
 
     async def fetch_calendar_items(
         self,
